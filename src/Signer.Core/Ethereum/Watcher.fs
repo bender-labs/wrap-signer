@@ -1,6 +1,9 @@
 namespace Signer.Ethereum
 
+open System.Collections.Generic
 open System.Numerics
+open Nethereum.ABI
+open Nethereum.Contracts
 open Nethereum.Hex.HexTypes
 open Nethereum.RPC.Eth.DTOs
 open Signer.Ethereum.Contract
@@ -75,73 +78,106 @@ module Watcher =
 
         loop from
 
+    let checkReceipt (web3: Web3) (lockingContract: Contract) hash =
+        async {
+            let! receipt =
+                web3.Eth.Transactions.GetTransactionReceipt.SendRequestAsync(hash)
+                |> Async.AwaitTask
+
+            let lockingContract =
+                web3.Eth.GetContract(lockingContractAbi, "")
+
+            let eventAbi =
+                lockingContract
+                    .GetEvent(
+                        "ExecutionFailure"
+                    )
+                    .EventABI
+
+            let t =
+                eventAbi.GetLogsForEvent(receipt.Logs).Length
+
+            return t = receipt.Logs.Count
+        }
+
     let watchForExecutionFailure
         (web3: Web3)
         ({ From = from
            Confirmations = confirmations
            Contract = contract })
         =
+
+
         let contract =
             web3.Eth.GetContract(lockingContractAbi, contract)
+
+        let erc20 = web3.Eth.GetContract(erc20Abi, "")
+
+        let check (t: TransactionFailure) =
+            async {
+                let! valid = checkReceipt web3 contract t.Log.TransactionHash
+
+                if valid then
+                    return Some t
+                else
+                    return None
+            }
+
+        let toExecutionFailure (log: FilterLog, lockContractCall: List<FunctionEncoding.ParameterOutput>) =
+
+            let tokenContract = lockContractCall.[0].Result :?> string
+
+            let transferCall =
+                erc20
+                    .GetFunction("transfer")
+                    .DecodeInput(
+                        Nethereum.Hex.HexConvertors.Extensions.HexByteConvertorExtensions.ToHex(
+                            lockContractCall.[2].Result :?> byte []
+                        )
+                    )
+
+            let to_ = transferCall.[0].Result :?> string
+            let amount = transferCall.[1].Result :?> bigint
+            let tezosTransactionIdentifier = lockContractCall.[3].Result :?> string
+
+            { Event =
+                  { TezosTransaction = tezosTransactionIdentifier
+                    Owner = to_
+                    TokenContract = tokenContract
+                    Amount = amount }
+              Log = log }
+
+
 
         let transactionFailed =
             contract.GetEvent<LockingContractExecutionFailureDto>()
 
+        let toTransferCalls (e: _ EventLog seq) =
+            e
+            |> Seq.map
+                (fun e ->
+                    web3.Eth.Transactions.GetTransactionByHash.SendRequestAsync(e.Log.TransactionHash)
+                    |> Async.AwaitTask
+                    |> Async.map
+                        (fun transaction ->
+                            (e.Log,
+                             contract
+                                 .GetFunction("execTransaction")
+                                 .DecodeInput(transaction.Input))))
+            |> Async.Parallel
+
+
 
         let exec (event: _ Nethereum.Contracts.Event) (filter: NewFilterInput) =
-            async {
-                let! changes = event.GetAllChanges filter |> Async.AwaitTask
-
-                let! txs =
-                    changes
-                    |> Seq.map
-                        (fun e ->
-                            web3.Eth.Transactions.GetTransactionByHash.SendRequestAsync(e.Log.TransactionHash)
-                            |> Async.AwaitTask
-                            |> Async.map (fun transaction -> (e.Log, transaction)))
-                    |> Async.Parallel
-
-                let calls =
-                    txs
-                    |> Seq.map
-                        (fun (log, transaction) ->
-                            log,
-                            contract
-                                .GetFunction("execTransaction")
-                                .DecodeInput(transaction.Input))
-
-                return
-                    calls
-                    |> Seq.map
-                        (fun (log, lockContractCall) ->
-                            let tokenContract = lockContractCall.[0].Result :?> string
-
-                            let erc20 =
-                                web3.Eth.GetContract(erc20Abi, tokenContract)
-
-                            let transferCall =
-                                erc20
-                                    .GetFunction("transfer")
-                                    .DecodeInput(
-                                        Nethereum.Hex.HexConvertors.Extensions.HexByteConvertorExtensions.ToHex(
-                                            lockContractCall.[2].Result :?> byte []
-                                        )
-                                    )
-
-                            let to_ = transferCall.[0].Result :?> string
-
-                            let amount = transferCall.[1].Result :?> bigint
-
-                            let tezosTransactionIdentifier = lockContractCall.[3].Result :?> string
-
-                            { Event =
-                                  { TezosTransaction = tezosTransactionIdentifier
-                                    Owner = to_
-                                    TokenContract = tokenContract
-                                    Amount = amount }
-                              Log = log })
-
-            }
+            event.GetAllChanges filter
+            |> Async.AwaitTask
+            |> Async.map toTransferCalls
+            |> Async.bind (fun e -> async { return! e })
+            |> Async.map (Seq.map toExecutionFailure)
+            |> Async.map (Seq.map check)
+            |> Async.map (Async.Parallel)
+            |> Async.bind (fun e -> async { return! e })
+            |> Async.map (Seq.choose id)
 
         let nextRun (next: HexBigInteger) (max: HexBigInteger) =
             let transactionFailedFilter =
@@ -178,7 +214,10 @@ module Watcher =
             |> Async.map
                 (fun events ->
                     events
-                    |> Seq.map (fun event -> { Log = event.Log; Event = ctor event.Event }))
+                    |> Seq.map
+                        (fun event ->
+                            { Log = event.Log
+                              Event = ctor event.Event }))
 
         let nextRun (next: HexBigInteger) (max: HexBigInteger) =
             let erc20Filter =
