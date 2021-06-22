@@ -11,6 +11,7 @@
     <Compile Include="Minting\Workflow.test.fs" />
     <Compile Include="Ethereum\Multisig.Test.fs" />
     <Compile Include="Ethereum\EthereumKey.Test.fs" />
+    <Compile Include="Ethereum\Watcher.Test.fs" />
     <Compile Include="Infrastructure\Ipfs.Test.fs" />
     <Compile Include="Infrastructure\State.Test.fs" />
     <Compile Include="Unwrap\Workflow.test.fs" />
